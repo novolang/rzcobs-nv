@@ -1,0 +1,236 @@
+// rzcobs — reverse zero-compressing COBS, the framing `defmt` sends its
+// logs in, over buffers the caller owns.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// WHAT IT IS.  A framing that removes every zero byte from a payload so
+// that a zero can end a frame, exactly as COBS does — and then spends
+// the header byte it needed anyway on a bitmap, so that a payload full
+// of zeros comes out SHORTER than it went in.  A log frame is mostly
+// zeros (a 32-bit index whose value is 12, a timestamp whose top bytes
+// have not moved), which is why `defmt` chose it over COBS.
+//
+// THE ALPHABET, EXACTLY.  Each header byte covers the literal bytes
+// that PRECEDE it, and there are four of them:
+//
+//   0x00              end of frame
+//   0x01..=0x7F       a seven-slot bitmap.  Bit i, LSB first: 1 means
+//                     the ith byte of the chunk was 0x00 and is not on
+//                     the wire, 0 means take one literal from the
+//                     stream.  Covers exactly seven output bytes.
+//   0x80..=0xFE       `1nnnnnnn`: take n + 7 literals, then output one
+//                     0x00.  Covers 8..134 output bytes.
+//   0xFF              take 134 literals, and output no trailing zero.
+//
+// A bitmap of zero would be the byte 0x00, which ends the frame, so
+// seven non-zero bytes cannot be a bitmap — they open a run instead,
+// and that is why the 0x80 family exists.
+//
+// REVERSE IS NOT A DETAIL.  A header FOLLOWS the bytes it covers, so
+// the encoder writes forward and never seeks back; COBS reserves the
+// header byte first and patches it once the block ends.  That single
+// difference is why this is the encoding to put in an interrupt
+// handler: the output is append-only, so it can be written straight
+// into a queue that only ever moves forward.  The cost is on the other
+// side — a decoder starts at the byte before the terminator and walks
+// BACKWARDS, so it needs the whole frame before it can begin, and
+// there is no streaming decoder here or anywhere.
+//
+// THE ROUND TRIP IS NOT EXACT.  A message comes back with up to six
+// zero bytes appended, because the last chunk is padded to seven
+// slots.  `decode(encode(m))` is `m` followed by 0..6 zeros, and a
+// caller who needs the exact length carries it above this layer.
+
+use std.bytes
+
+// What went wrong while decoding, and where.
+//
+// Every variant is an input fault, so every one is a value: a frame
+// arriving off a wire is data, and refusing to answer is a result while
+// crashing is not.  Each carries an offset into the encoded frame, so a
+// receiver logging a bad frame can say where it stopped making sense.
+//
+// The names are all prefixed because a decoder for this format and one
+// for plain COBS are in the same program more often than not — `novo
+// logs` decodes rzCOBS off RTT and COBS off a UART — and a variant is
+// constructed by name across the whole assembly.
+pub enum RzcobsError
+    // A 0x00 before the end of the frame.  The encoding never produces
+    // one, so it is the terminator arriving early or the frame being
+    // corrupt.
+    RzcobsZeroInFrame(at: Int)
+    // A header covering more literal bytes than precede it in the
+    // frame.
+    RzcobsTruncated(at: Int)
+    // The frame does not end in 0x00.  A caller that split a stream on
+    // the terminator will not see this; one that handed over a partial
+    // read will.
+    RzcobsUnterminated(len: Int)
+
+// The standard `Error` implementation, so a bad frame can be reported
+// by anything that reports errors.
+impl Error for RzcobsError
+    // Answer the one-line report: what was wrong with the frame, and at
+    // which offset in it.  The offset is in the text rather than left
+    // for the caller to add, because a receiver logging one frame in a
+    // thousand is the caller least likely to still have the frame.
+    fn message(self) -> Str
+        todo("rzcobs.RzcobsError.message")
+
+// The most bytes `encode` can produce from `len` bytes of payload,
+// terminator included.
+//
+// `len + ceil(len / 134) + 1`.  Treat it as the buffer to reserve: it
+// is never too small, and never wasteful by more than the headers a
+// payload of non-zero bytes would have needed anyway.  A payload with
+// zeros in it comes out well under the bound, which is the whole point
+// of the format.
+//
+// ```novo
+// use rzcobs
+//
+// fn main() [io]
+//     println("${rzcobs.max_encoded_len(0)}")     // 1
+//     println("${rzcobs.max_encoded_len(1)}")     // 3
+//     println("${rzcobs.max_encoded_len(134)}")   // 136
+// ```
+pub fn max_encoded_len(len: Int) -> Int
+    todo("rzcobs.max_encoded_len")
+
+// Encode `src` at the cursor and answer the byte count written,
+// terminator included.  Writes into the caller's buffer and allocates
+// nothing.
+//
+// The cursor must have `max_encoded_len(bytes.len(src))` bytes of room.
+// Too little is a panic, exactly as it is for `c.put_u8` and for
+// `xs[i]`: a buffer the caller sized wrong is a mistake in the program,
+// not a value the program should carry around.
+//
+// Unlike `cobs.encode_into`, this one WRITES THE TERMINATOR.  The 0x00
+// is a header value in this format's own alphabet rather than an
+// out-of-band delimiter a caller adds, and a frame without it cannot be
+// decoded at all — there is nowhere else for the decoder to start.
+//
+// ```novo
+// use std.bytes
+// use rzcobs
+//
+// // Six literals and a zero: the zero is not on the wire, the 0x40
+// // header is what stands for it.
+// fn main() [io]
+//     let payload = bytes.from_hex("11223344556600") ?? bytes.zeros(0)
+//     var out = bytes.cursor_le(bytes.zeros(rzcobs.max_encoded_len(7)))
+//     let n = rzcobs.encode_into(out, payload)
+//     println(bytes.to_hex(bytes.slice(out.finish(), 0, n)))   // 1122334455664000
+// ```
+pub fn encode_into(mut dst: Cursor, src: Bytes) -> Int
+    todo("rzcobs.encode_into")
+
+// Encode `src` into a fresh buffer of exactly the length it needed,
+// terminator included.
+//
+// One allocation, for the caller assembling a message rather than
+// filling a frame.  The answer contains exactly one 0x00 and it is the
+// last byte, so frames may be concatenated and split again on it.
+//
+// ```novo
+// use std.bytes
+// use rzcobs
+//
+// fn main() [io]
+//     // Thirteen zeros and a 0xFF, in three bytes and a terminator.
+//     let payload = bytes.from_hex("00000000000000000000000000ff") ?? bytes.zeros(0)
+//     println(bytes.to_hex(rzcobs.encode(payload)))   // 7fff3f00
+// ```
+pub fn encode(src: Bytes) -> Bytes
+    todo("rzcobs.encode")
+
+// How many bytes `wire` decodes to, without decoding it.
+//
+// This is public because the format made it necessary rather than
+// because it is convenient.  A reverse decoder discovers the LAST chunk
+// first, so it cannot place its first output byte until it knows where
+// the output ends — and a caller sizing a destination buffer is in the
+// same position.  One walk of the headers answers both, and it is the
+// same walk `decode_into` makes before it writes anything.
+//
+// `wire` is one frame INCLUDING its 0x00 terminator.  The count does
+// not include the padding rule's effect on meaning, only on length: a
+// message of one byte answers 7, because seven is what comes out.
+//
+// ```novo
+// use std.bytes
+// use rzcobs
+//
+// fn main() [io]
+//     match rzcobs.decoded_len(bytes.from_hex("017e00") ?? bytes.zeros(0))
+//         Ok(n)  => println("${n}")   // 7
+//         Err(e) => println(e.message())
+// ```
+pub fn decoded_len(wire: Bytes) -> Result<Int, RzcobsError>
+    todo("rzcobs.decoded_len")
+
+// Decode `wire` at the cursor and answer the byte count written.
+// Writes into the caller's buffer and allocates nothing.
+//
+// The cursor must have `decoded_len(wire)` bytes of room, which is the
+// reason that function is public.  `wire` is one frame including its
+// terminator: a 0x00 anywhere before the last byte is `RzcobsZeroInFrame`,
+// and a frame that does not end in one is `RzcobsUnterminated`.
+//
+// ```novo
+// use std.bytes
+// use rzcobs
+//
+// fn main() [io]
+//     let wire = bytes.from_hex("1122334455664000") ?? bytes.zeros(0)
+//     var out = bytes.cursor_le(bytes.zeros(7))
+//     match rzcobs.decode_into(out, wire)
+//         Ok(n)  => println(bytes.to_hex(bytes.slice(out.finish(), 0, n)))   // 11223344556600
+//         Err(e) => println(e.message())
+// ```
+pub fn decode_into(mut dst: Cursor, wire: Bytes) -> Result<Int, RzcobsError>
+    todo("rzcobs.decode_into")
+
+// Decode `wire` into a fresh buffer of exactly the length it needed.
+//
+// The round trip recovers the payload followed by up to six zero bytes,
+// never fewer bytes and never different ones — see the padding note at
+// the top of this module.  A frame no encoder produced is an `Err`
+// naming the offset, never a panic: a receiver holding a corrupt frame
+// wants to log it and read the next one.
+//
+// ```novo
+// use std.bytes
+// use rzcobs
+//
+// fn main() [io]
+//     match rzcobs.decode(bytes.from_hex("7fff3f00") ?? bytes.zeros(0))
+//         Ok(p)  => println(bytes.to_hex(p))   // 00000000000000000000000000ff
+//         Err(e) => println(e.message())
+// ```
+pub fn decode(wire: Bytes) -> Result<Bytes, RzcobsError>
+    todo("rzcobs.decode")
+
+// Where the frame that starts at `from` ends, as the offset of its 0x00
+// terminator — or `None` when `buf` holds no terminator at or after
+// `from` and the frame is still arriving.
+//
+// The one function a stream reader needs and cannot write correctly by
+// accident: the terminator is the only 0x00 in an encoded frame, so
+// splitting a stream on it is exact, and `None` is "read more" rather
+// than a fault.
+//
+// ```novo
+// use std.bytes
+// use rzcobs
+//
+// fn main() [io]
+//     let stream = bytes.from_hex("017e00027d00") ?? bytes.zeros(0)
+//     match rzcobs.frame_end(stream, 0)
+//         None    => println("partial")
+//         Some(i) => println("${i}")   // 2
+// ```
+pub fn frame_end(buf: Bytes, from: Int) -> ?Int
+    todo("rzcobs.frame_end")

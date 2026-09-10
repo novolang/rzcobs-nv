@@ -1,0 +1,177 @@
+// rzcobs_core — the rzCOBS encoder as a state machine that allocates
+// nothing, holds no buffer, and builds for a microcontroller.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// WHY THERE IS A SECOND MODULE.  `rzcobs` speaks `Bytes` and `Cursor`,
+// and neither links at `@tier(embedded)`: the embedded runtime defines
+// no `novo_bytes_*` symbol, so a device that called one would fail at
+// the linker rather than at the type checker.  One host-only function
+// anywhere in a compilation unit is an undefined symbol on a device
+// whether or not the firmware calls it, so the half a device uses is
+// its own module and takes and returns integers.
+//
+// WHY IT IS AN ENCODER AND NOT A CODEC.  rzCOBS is decoded from the
+// END of a frame backwards, so a decoder needs the whole frame in one
+// place before it can start.  A device sending logs never decodes one.
+// The decoder is in `rzcobs`, over a buffer, where the host is.
+//
+// THE STATE IS TWO INTEGERS.  `run` counts the bytes of the current
+// chunk that have been consumed; `zeros` is the 7-bit map of which of
+// those were zero.  `zeros` is non-zero only while `run` is below 7,
+// because a chunk that reaches 7 with a zero in it is flushed at once —
+// so `run >= 7` is exactly "a run of non-zero bytes is open", and the
+// two fields need no third flag to tell the modes apart.
+
+// The most bytes of a chunk one bitmap header can cover.
+//
+// Seven, because a header byte below 0x80 is a bitmap with one bit per
+// covered byte and the top bit is what distinguishes it from a run
+// header.  It is the reason a decoded message can come back with up to
+// six zero bytes appended: the last chunk is padded to seven.
+pub fn bitmap_span() -> Int
+    todo("rzcobs_core.bitmap_span")
+
+// The most literal bytes one run header can cover.
+//
+// 134, which is the 0xFF header — `1nnnnnnn` covers `n + 7` literals
+// and `n` is seven bits, so 127 + 7.  It is also the format's overhead
+// bound: a message of non-zero bytes costs one header per 134 of them.
+pub fn run_span() -> Int
+    todo("rzcobs_core.run_span")
+
+// The byte that ends a frame.
+//
+// Zero, and it is the one header value the encoding never produces —
+// which is what lets a receiver split a stream into frames by looking
+// for it and nothing else.
+pub fn terminator() -> Int
+    todo("rzcobs_core.terminator")
+
+// The encoder between two bytes: the chunk it has open, and nothing
+// else.
+//
+// A `@value` struct, so it lives in the caller's stack frame with no
+// header, no reference count and no allocation.  An interrupt handler
+// that owns one owns eight or sixteen bytes of its own frame.
+//
+// `run` is how many of the current chunk's bytes have been consumed —
+// 0..6 while a bitmap is being built, 7..133 while a run of non-zero
+// bytes is open.  `zeros` is the bitmap, bit `i` set when the `i`th
+// byte of the chunk was zero; it is 0 whenever `run` is 7 or more.
+pub @value
+struct RzEncoder
+    run: Int
+    zeros: Int
+
+// What one step of the encoder produced: the encoder after the step,
+// and the bytes to write.
+//
+// `out` is a fixed two-byte inline array rather than a list because two
+// is the most any step can produce — a literal and the header that
+// closes the chunk it filled — and a list would be a heap allocation
+// in an interrupt handler.  `len` is how many of the two are real,
+// 0, 1 or 2; a step that emitted nothing leaves `len` at 0 and the
+// caller writes nothing.
+//
+// This is the shape the whole no-allocation claim rests on.  A `@value`
+// struct cannot be a `Result` payload, an optional payload or a field
+// of a boxed struct, so an encoder that reports through one of those
+// has left the tier it was written for.  Returning the new state and
+// the bytes together in one unboxed value is the shape that stays.
+pub @value
+struct RzEmit
+    enc: RzEncoder
+    out: [u8; 2]
+    len: Int
+
+// A fresh encoder, with no chunk open.
+//
+// ```novo
+// use rzcobs_core
+//
+// fn main() [io]
+//     let e = rzcobs_core.encoder()
+//     println("${e.run} ${e.zeros}")   // 0 0
+// ```
+pub fn encoder() -> RzEncoder
+    todo("rzcobs_core.encoder")
+
+// Feed one byte, and answer the encoder after it with the bytes to
+// write.
+//
+// The whole format is in this function, and it is four cases:
+//
+//   * a chunk is being built (`run` under 7) and `b` is zero — set bit
+//     `run` of the bitmap and emit nothing; the zero never goes on the
+//     wire, which is the compression;
+//   * a chunk is being built and `b` is not zero — emit `b` as a
+//     literal;
+//   * either of the above brought `run` to 7 with a non-empty bitmap —
+//     also emit the bitmap as the header, and start a new chunk.  A
+//     bitmap of 0 is not emitted, because 0x00 ends the frame: seven
+//     non-zero bytes leave the run open instead, which is the third
+//     case;
+//   * a run of non-zero bytes is open (`run` at least 7).  A non-zero
+//     `b` is one more literal, and at 134 of them the 0xFF header
+//     closes the run with no trailing zero.  A zero `b` closes it with
+//     `(run - 7) | 0x80`, and that header's own trailing zero is the
+//     byte — so, again, the zero never goes on the wire.
+//
+// Every case emits at most two bytes, which is why `out` holds two.
+//
+// ```novo
+// use rzcobs_core
+//
+// // Six literals and then a zero: the zero is not written, it is what
+// // the 0x40 header stands for.
+// fn main() [io]
+//     var e = rzcobs_core.encoder()
+//     var step = rzcobs_core.push(e, 0x11 as u8)
+//     println("${step.len}")   // 1
+// ```
+pub fn push(e: RzEncoder, b: u8) -> RzEmit
+    todo("rzcobs_core.push")
+
+// Close the message and answer the last header and the terminator.
+//
+// A chunk that is still open is padded to seven with zeros and written
+// as a bitmap; an open run is written as `(run - 7) | 0x80`; a chunk
+// that consumed nothing writes no header at all.  The 0x00 terminator
+// follows in every case, so `len` is 1 or 2 and never 0.
+//
+// The padding is why the round trip is not exact: a message of one
+// non-zero byte comes back as that byte followed by six zeros, because
+// the bitmap that carried it covers seven slots and the decoder has no
+// way to know which of them the sender meant.  `defmt` lives with this
+// — its frames are self-delimiting above this layer — and a caller who
+// cannot must carry its own length.
+//
+// ```novo
+// use rzcobs_core
+//
+// fn main() [io]
+//     let step = rzcobs_core.finish(rzcobs_core.encoder())
+//     println("${step.len}")   // 1
+// ```
+pub fn finish(e: RzEncoder) -> RzEmit
+    todo("rzcobs_core.finish")
+
+// The most bytes `push` and `finish` can produce for a message of
+// `len` bytes, terminator included.
+//
+// `len + ceil(len / 134) + 1`.  One header per 134 non-zero bytes is
+// the worst case, because a chunk with a zero in it spends its header
+// on a byte it did not write; the `+ 1` is the terminator.  A caller
+// sizing a transmit buffer wants this number and never a byte more.
+//
+// ```novo
+// use rzcobs_core
+//
+// fn main() [io]
+//     println("${rzcobs_core.max_encoded_len(0)}")     // 1
+//     println("${rzcobs_core.max_encoded_len(134)}")   // 136
+// ```
+pub fn max_encoded_len(len: Int) -> Int
+    todo("rzcobs_core.max_encoded_len")

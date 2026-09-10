@@ -1,0 +1,249 @@
+// tests/rzcobs_tests.nv — the API tests, written against the
+// signatures.
+//
+// They COMPILE today and they FAIL at run, with `not implemented:
+// rzcobs.<fn>` from the `todo()` that is each body.  That is the
+// expected state of an interface release: the compiler has checked
+// every signature, every type and every effect row, and nothing else
+// has been checked because there is nothing else yet.
+//
+// EVERY VECTOR BELOW IS THE RUST CRATE'S OWN, with one difference the
+// header of each test names: `rzcobs`'s `encode` answers the frame and
+// leaves the terminator to its caller, and this package writes the
+// terminator, so each expected encoding here carries a trailing `00`
+// the crate's does not.  The payloads and the header bytes are
+// unchanged, which is what wire compatibility means.
+
+use std.test
+use std.bytes
+use rzcobs
+use rzcobs_core
+
+// A payload written the way a reader can check it against the crate.
+fn hex(s: Str) -> Bytes
+    bytes.from_hex(s) ?? bytes.zeros(0)
+
+@test
+fn test_the_format_s_three_constants()
+    // Real today: three numbers that need no body to be checked once
+    // the bodies land, and that a reader of the module header can
+    // compare with the alphabet written there.
+    test.assert_eq(rzcobs_core.bitmap_span(), 7)
+    test.assert_eq(rzcobs_core.run_span(), 134)
+    test.assert_eq(rzcobs_core.terminator(), 0)
+
+@test
+fn test_the_length_bound_is_one_header_per_134_bytes()
+    // An empty message is one terminator.
+    test.assert_eq(rzcobs.max_encoded_len(0), 1)
+    // One byte needs its literal, a bitmap header and the terminator.
+    test.assert_eq(rzcobs.max_encoded_len(1), 3)
+    // A full run: 134 literals, the 0xFF header, the terminator.
+    test.assert_eq(rzcobs.max_encoded_len(134), 136)
+    // One past a full run opens a second header.
+    test.assert_eq(rzcobs.max_encoded_len(135), 138)
+    // The two halves of the package agree on the bound, which is what
+    // lets a device size a buffer with the module that builds for it.
+    test.assert_eq(rzcobs_core.max_encoded_len(134), rzcobs.max_encoded_len(134))
+
+@test
+fn test_a_run_of_zeros_costs_one_byte_per_seven()
+    // The crate's vectors: zeros are carried in the bitmap and never on
+    // the wire, so seven of them are one header byte.
+    test.assert_eq(bytes.to_hex(rzcobs.encode(hex("00"))), "7f00")
+    test.assert_eq(bytes.to_hex(rzcobs.encode(hex("0000"))), "7f00")
+    test.assert_eq(bytes.to_hex(rzcobs.encode(hex("00000000000000"))), "7f00")
+    // Eight zeros open a second chunk, which the padding fills out.
+    test.assert_eq(bytes.to_hex(rzcobs.encode(hex("0000000000000000"))), "7f7f00")
+
+@test
+fn test_a_short_chunk_is_padded_to_seven_slots()
+    // `01` is one literal and six padding zeros: bitmap 0b1111110.
+    test.assert_eq(bytes.to_hex(rzcobs.encode(hex("01"))), "017e00")
+    // Which is why a trailing zero costs nothing — it was already
+    // implied by the padding.
+    test.assert_eq(bytes.to_hex(rzcobs.encode(hex("0100"))), "017e00")
+    // A leading zero moves the set bit instead: 0b1111101.
+    test.assert_eq(bytes.to_hex(rzcobs.encode(hex("0001"))), "017d00")
+    // Two literals, five padding zeros: 0b1111100.
+    test.assert_eq(bytes.to_hex(rzcobs.encode(hex("0102"))), "01027c00")
+
+@test
+fn test_seven_bytes_with_a_zero_are_a_bitmap()
+    // Six literals then a zero: bit 6 set, bits 0..5 clear.
+    test.assert_eq(bytes.to_hex(rzcobs.encode(hex("11223344556600"))),
+                   "1122334455664000")
+
+@test
+fn test_seven_non_zero_bytes_open_a_run_instead()
+    // A bitmap of zero would be the terminator, so seven non-zero bytes
+    // cannot be one: they become `1nnnnnnn` with n = 0, and the run
+    // header brings a trailing zero of its own.
+    test.assert_eq(bytes.to_hex(rzcobs.encode(hex("11223344556677"))),
+                   "112233445566778000")
+    // Which is why these two payloads have the same encoding — the
+    // format is not injective, and the note in the module header is
+    // this fact.
+    test.assert_eq(bytes.to_hex(rzcobs.encode(hex("1122334455667700"))),
+                   "112233445566778000")
+    // n = 1 covers eight literals.
+    test.assert_eq(bytes.to_hex(rzcobs.encode(hex("1122334455667788"))),
+                   "11223344556677888100")
+
+@test
+fn test_the_compression_is_the_point()
+    // Thirteen zeros and a byte, in three bytes of frame: the crate's
+    // vector, and the reason defmt frames its logs this way rather than
+    // with COBS.
+    test.assert_eq(bytes.to_hex(rzcobs.encode(hex("00000000000000000000000000ff"))),
+                   "7fff3f00")
+    // A byte in the middle of the zeros moves one bit of one bitmap.
+    test.assert_eq(bytes.to_hex(rzcobs.encode(hex("00000000004400000000000000ff"))),
+                   "445fff3f00")
+
+@test
+fn test_a_full_run_closes_with_ff_and_no_trailing_zero()
+    // 134 non-zero bytes is the largest run one header can cover, and
+    // 0xFF is the one header that carries no zero after it.  The length
+    // is the assertion because the payload is the interesting part and
+    // 134 bytes of it are not.
+    var payload = bytes.zeros(0)
+    for i in 0..134
+        payload = bytes.concat([payload, bytes.u8(i % 255 + 1)])
+    let wire = rzcobs.encode(payload)
+    test.assert_eq(bytes.len(wire), 136)
+    test.assert_eq(bytes.byte_at(wire, 134) ?? 0, 0xFF)
+    test.assert_eq(bytes.byte_at(wire, 135) ?? 0, 0x00)
+
+@test
+fn test_the_round_trip_appends_up_to_six_zeros()
+    // The property a caller has to know about: a chunk is padded to
+    // seven slots, so a decoder cannot tell a sent zero from a padding
+    // one.  Seven bytes come back from one.
+    match rzcobs.decode(hex("017e00"))
+        Err(e) => test.fail(e.message())
+        Ok(p)  => test.assert_eq(bytes.to_hex(p), "01000000000000")
+
+@test
+fn test_a_payload_whose_length_is_a_multiple_of_seven_round_trips_exactly()
+    // Where the padding has nothing to add, the round trip is the
+    // identity — which is the case a caller can arrange for.
+    let payload = hex("11223344556600")
+    match rzcobs.decode(rzcobs.encode(payload))
+        Err(e) => test.fail(e.message())
+        Ok(p)  => test.assert_eq(bytes.to_hex(p), "11223344556600")
+
+@test
+fn test_the_output_length_is_known_before_the_output_is()
+    // `decoded_len` is public because the decode is backwards: the last
+    // chunk is read first, so nothing can be placed until the total is
+    // known.
+    match rzcobs.decoded_len(hex("017e00"))
+        Err(e) => test.fail(e.message())
+        Ok(n)  => test.assert_eq(n, 7)
+    match rzcobs.decoded_len(hex("7fff3f00"))
+        Err(e) => test.fail(e.message())
+        Ok(n)  => test.assert_eq(n, 14)
+
+@test
+fn test_decoding_into_a_caller_s_buffer_allocates_nothing()
+    let wire = hex("1122334455664000")
+    var out = bytes.cursor_le(bytes.zeros(7))
+    match rzcobs.decode_into(out, wire)
+        Err(e) => test.fail(e.message())
+        Ok(n)  =>
+            test.assert_eq(n, 7)
+            test.assert_eq(bytes.to_hex(bytes.slice(out.finish(), 0, n)),
+                           "11223344556600")
+
+@test
+fn test_encoding_into_a_caller_s_buffer_allocates_nothing()
+    let payload = hex("11223344556600")
+    var out = bytes.cursor_le(bytes.zeros(rzcobs.max_encoded_len(7)))
+    let n = rzcobs.encode_into(out, payload)
+    test.assert_eq(n, 8)
+    test.assert_eq(bytes.to_hex(bytes.slice(out.finish(), 0, n)),
+                   "1122334455664000")
+
+@test
+fn test_a_zero_before_the_end_is_the_frame_being_wrong()
+    // The terminator is the only zero an encoded frame contains, so one
+    // anywhere else is a fault carrying its offset.
+    match rzcobs.decode(hex("01000000"))
+        Ok(p)  => test.fail("a zero at offset 1 is not decodable: ${bytes.to_hex(p)}")
+        Err(e) =>
+            match e
+                RzcobsZeroInFrame(at) => test.assert_eq(at, 1)
+                RzcobsTruncated(at)   => test.fail("expected a zero fault, got truncated at ${at}")
+                RzcobsUnterminated(n) => test.fail("expected a zero fault, got unterminated at ${n}")
+
+@test
+fn test_a_header_that_claims_more_than_the_frame_has()
+    // `0x81` covers eight literals and only one precedes it.
+    match rzcobs.decode(hex("118100"))
+        Ok(p)  => test.fail("a header over the frame's start is not decodable: ${bytes.to_hex(p)}")
+        Err(e) =>
+            match e
+                RzcobsTruncated(at)   => test.assert_eq(at, 1)
+                RzcobsZeroInFrame(at) => test.fail("expected truncated, got a zero at ${at}")
+                RzcobsUnterminated(n) => test.fail("expected truncated, got unterminated at ${n}")
+
+@test
+fn test_a_frame_with_no_terminator_is_named_as_such()
+    // A caller that handed over a partial read gets told which of the
+    // two it is rather than a spurious decode.
+    match rzcobs.decode(hex("017e"))
+        Ok(p)  => test.fail("an unterminated frame is not decodable: ${bytes.to_hex(p)}")
+        Err(e) =>
+            match e
+                RzcobsUnterminated(n) => test.assert_eq(n, 2)
+                RzcobsZeroInFrame(at) => test.fail("expected unterminated, got a zero at ${at}")
+                RzcobsTruncated(at)   => test.fail("expected unterminated, got truncated at ${at}")
+
+@test
+fn test_a_stream_splits_on_the_terminator_and_nowhere_else()
+    // Two frames end to end.  `frame_end` answers the first
+    // terminator's offset, and `None` for a frame still arriving.
+    let stream = hex("017e00027d00")
+    match rzcobs.frame_end(stream, 0)
+        None    => test.fail("the first frame ends at offset 2")
+        Some(i) => test.assert_eq(i, 2)
+    match rzcobs.frame_end(stream, 3)
+        None    => test.fail("the second frame ends at offset 5")
+        Some(i) => test.assert_eq(i, 5)
+    match rzcobs.frame_end(hex("017e"), 0)
+        None    => test.assert_true(true, "a partial frame has no terminator")
+        Some(i) => test.fail("a partial frame has no end, got ${i}")
+
+@test
+fn test_the_device_encoder_emits_at_most_two_bytes_a_step()
+    // The claim `RzEmit`'s two-byte array rests on, as an assertion
+    // rather than a comment: a literal and the header that closes the
+    // chunk it filled is the most one byte can produce.
+    var e = rzcobs_core.encoder()
+    for i in 0..7
+        let step = rzcobs_core.push(e, 0x11 as u8)
+        test.assert_true(step.len <= 2, "a step emits at most two bytes")
+        e = step.enc
+    let last = rzcobs_core.finish(e)
+    test.assert_true(last.len <= 2, "finish emits at most two bytes")
+    // `finish` always writes the terminator, so it never emits nothing.
+    test.assert_true(last.len >= 1, "finish always writes the terminator")
+
+@test
+fn test_the_device_encoder_and_the_buffer_encoder_agree()
+    // The two halves of the package are one format, and this is where
+    // that is checked rather than assumed: driving `rzcobs_core` byte
+    // by byte produces exactly what `rzcobs.encode` produces.
+    let payload = hex("11223344556600")
+    var e = rzcobs_core.encoder()
+    var got = bytes.zeros(0)
+    for i in 0..7
+        let step = rzcobs_core.push(e, (bytes.byte_at(payload, i) ?? 0) as u8)
+        e = step.enc
+        for k in 0..step.len
+            got = bytes.concat([got, bytes.u8(step.out[k] as Int)])
+    let last = rzcobs_core.finish(e)
+    for k in 0..last.len
+        got = bytes.concat([got, bytes.u8(last.out[k] as Int)])
+    test.assert_eq(bytes.to_hex(got), bytes.to_hex(rzcobs.encode(payload)))

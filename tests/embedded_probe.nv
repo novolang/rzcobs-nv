@@ -1,0 +1,80 @@
+// tests/embedded_probe.nv — the package's device claim, as a program
+// that either builds for a Cortex-M or does not.
+//
+// The shard audit's `core-embedded` row copies this and the modules its
+// `use` lines reach into a package of its own and runs
+//
+//   novo build --target=nrf52-qemu src/probe.nv
+//
+// which produces a real Cortex-M4 ELF or fails.  For a log framing the
+// claim is the whole point: the encoder runs in the interrupt that
+// writes the log, and a framing that could not compile for a device
+// would have no reason to be reverse.
+//
+// It BUILDS; it does not run.  Every function it calls is a `todo()`
+// today, so a device that executed this would panic on the first line
+// of `main`.  What is being checked is the tier: `--target=nrf52-qemu`
+// stamps `@tier(embedded)` on every function it compiles, so the
+// checker walks the module and refuses a `Str` concatenation, a `Bytes`
+// call or an unbounded `while` wherever the implementation later puts
+// one.
+//
+// `rzcobs` IS NOT USED HERE, and that is the split rather than a
+// convenience: that module speaks `Bytes` and `Cursor`, the embedded
+// runtime defines no `novo_bytes_*` symbol, and one host-only function
+// anywhere in a compilation unit is an undefined symbol at embedded
+// link time whether or not the firmware calls it.
+
+use rzcobs_core
+
+// A log frame the way firmware would hold one.
+//
+// The array is a FIELD of a `@value` struct rather than a return type,
+// because `[u8; 8]` is a true inline array only inside one — outside,
+// the annotation still means a list, and a list literal is an implicit
+// heap allocation the tier refuses (SPEC § 14.4).  So a device that
+// wants eight bytes on its stack names a struct for them, which is what
+// `RzEmit` does inside the package and what this does outside it.
+@value
+struct ProbeFrame
+    b: [u8; 8]
+
+// An interned format index of 12, a zero argument and a two-byte
+// timestamp — the shape whose zeros this format exists to remove.
+fn frame_bytes() -> ProbeFrame
+    ProbeFrame { b: [0x0C as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+                     0x00 as u8, 0x00 as u8, 0x2A as u8, 0x01 as u8] }
+
+fn main() [hw]
+    // The three constants, so the arithmetic that reads them is
+    // compiled for the device and not only for the host.
+    let span = rzcobs_core.bitmap_span()
+    let room = rzcobs_core.max_encoded_len(8)
+
+    // The encoder driven byte at a time, which is the shape an
+    // interrupt handler has: one byte in, at most two bytes out, and
+    // nothing allocated to pass either.
+    //
+    // Each step is bound with its type written out because a call into
+    // another module does not have its return type inferred in a
+    // single-file build.  Inside a package built as one unit — which is
+    // what every host suite does — none of these annotations is needed.
+    let src = frame_bytes()
+    var e: RzEncoder = rzcobs_core.encoder()
+    for i in 0..8
+        let step: RzEmit = rzcobs_core.push(e, src.b[i])
+        e = step.enc
+        for k in 0..step.len
+            // A real transport would put this byte in a queue; here the
+            // read is what forces the array access to be compiled.
+            let b: u8 = step.out[k]
+            hal.uart.write(".")
+
+    // And the close, which is where the last header and the terminator
+    // come from.
+    let last: RzEmit = rzcobs_core.finish(e)
+    for k in 0..last.len
+        let b: u8 = last.out[k]
+        hal.uart.write("!")
+
+    hal.uart.write("rzcobs-nv: one frame framed\n")
