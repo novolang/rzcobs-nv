@@ -1,191 +1,245 @@
 # rzcobs-nv
 
-**Status: NOT IMPLEMENTED — interface only.**
+Reverse zero-compressing COBS is a framing: it removes every zero byte
+from a payload, so that a zero byte can mark the end of a frame. It is
+the framing the Rust logging library
+[defmt](https://defmt.ferrous-systems.com/encoding) sends its log frames
+in, and the
+[rzcobs crate](https://docs.rs/rzcobs) is its reference implementation.
+This package brings the format to novo-lang: an encoder a device can run
+in an interrupt handler, and a decoder for the host that reads the logs.
 
-Every public function below is published with its signature and its
-effect row, and every body is `todo()`.  Installing this package works;
-calling it panics with `not implemented`.
+**Status: NOT IMPLEMENTED — interface only.** Every function is declared
+with its full signature, but every body is a `todo()` that panics when
+called. The package is published so its design can be reviewed and
+depended on before it is implemented. Version 0.1.0 will be the first
+working release.
 
-## What this is
+## What the format is
 
-Reverse zero-compressing COBS: the framing `defmt` sends its logs in.
-Like COBS it removes every zero byte from a payload so that a zero can
-end a frame.  Unlike COBS it spends the header byte it needed anyway on
-a **bitmap of which bytes were zero**, so a payload full of zeros comes
-out shorter than it went in — and it puts each header **after** the
-bytes it covers, so the encoder never seeks backwards.
+A framing turns a stream of bytes into a sequence of messages. The usual
+way is to pick one byte value as the end-of-frame marker and remove that
+value from the payload. Consistent Overhead Byte Stuffing (COBS) is the
+classic scheme: it removes zero bytes by writing, before each block of
+data, a **header** byte saying how far the next zero is.
 
-A log frame is mostly zeros: an interned format index whose value is 12
-in a 32-bit field, an argument that is 0, a timestamp whose top bytes
-have not moved since the last line.  That is why `defmt` chose this over
-COBS, and it is why the device side of novo-lang's deferred logging
-needs it.
+rzCOBS changes two things about that. Its header comes **after** the
+bytes it covers, and the header of a short chunk is a **bitmap** saying
+which of those bytes were zero rather than a distance.
 
-## Adding it, and checking it
+A bitmap header covers seven output bytes. Each of its seven low bits,
+least significant first, says whether that byte was zero. A zero byte is
+never written to the wire, so seven zeros cost one header byte and
+nothing else. A log frame is mostly zeros, which is why defmt chose this
+scheme: a 32-bit format index holding the value 12 is three zeros and a
+byte.
 
-```bash
-novo pkg add rzcobs-nv       # into your novo.toml
-novo pkg build               # type- and effect-check the package
-novo test --isolate tests/rzcobs_tests.nv
+A header that follows its chunk means the encoder never writes backwards.
+It appends a literal or a header and moves on, so it can write straight
+into a queue that only moves forward. The cost falls on the decoder: it
+starts at the byte before the terminator and walks backwards, so it needs
+the whole frame before it can begin.
+
+These are the four header values, and everything else follows from them.
+
+| Header | Meaning | Output bytes covered |
+| --- | --- | --- |
+| `0x00` | End of frame. | — |
+| `0x01`–`0x7F` | A seven-slot bitmap. Bit *i*, least significant first: 1 means the *i*th byte was zero and is not on the wire; 0 means take one literal. | 7 |
+| `0x80`–`0xFE` | `1nnnnnnn`: take *n* + 7 literals, then output one zero byte. | 8 to 134 |
+| `0xFF` | Take 134 literals, and output no trailing zero. | 134 |
+
+A bitmap of zero would be the byte `0x00`, which ends the frame. Seven
+non-zero bytes therefore cannot be a bitmap, and they open a run
+instead. That is what the `0x80` family is for.
+
+| Quantity | Value |
+| --- | --- |
+| Output bytes one bitmap header covers | 7 |
+| Literals one run header covers | 8 to 134 |
+| The terminator | `0x00` |
+| Longest encoding of `n` bytes, terminator included | `n + ceil(n / 134) + 1` |
+| Encoding of 134 non-zero bytes | 136 bytes |
+| Encoding of an empty payload | 1 byte |
+| Bytes one encoder step can produce | 0, 1 or 2 |
+| Zero bytes a round trip may append | 0 to 6 |
+
+## Install
+
+```
+novo pkg add rzcobs-nv
 ```
 
-`novo test` is red today and that is the point of the release: every
-assertion below the first three constants fails with `not implemented:
-rzcobs.<fn>`.  They turn green one at a time as bodies land.
-
-## The one example that will work
+## Example
 
 ```novo
 use std.bytes
 use rzcobs
 
-// Thirteen zeros and a byte — fourteen bytes of payload — leave in a
-// four-byte frame, terminator included.
 fn main() [io]
+    // Fourteen bytes of payload: thirteen zeros and one 0xFF.
     let payload = bytes.from_hex("00000000000000000000000000ff") ?? bytes.zeros(0)
-    println(bytes.to_hex(rzcobs.encode(payload)))   // 7fff3f00
+
+    // Four bytes on the wire, terminator included. Two bitmap headers
+    // stand for the thirteen zeros, and the 0xFF is the only literal.
+    println(bytes.to_hex(rzcobs.encode(payload)))
 ```
 
-## How it differs from cobs-nv, and when each is right
+Build and test with `novo pkg build` and `novo test`. Today `novo test`
+fails on purpose: every test past the three constants reaches a
+`not implemented: rzcobs.<fn>` panic. The tests are the specification the
+implementation will have to satisfy.
 
-Both packages remove zeros so that a zero can delimit a frame.  Three
-things separate them, and each one decides a case.
+## What the package contains
 
-| | cobs-nv | rzcobs-nv |
-| --- | --- | --- |
-| where the header sits | before the block it covers | **after** the chunk it covers |
-| a payload of zeros | one byte of overhead per 254, always | one byte **total** per seven zeros |
-| decoding | forward, streaming, one pass | **backwards**, whole frame first |
-| the terminator | the caller's to write | this package writes it — 0x00 is a value in this format's own alphabet |
-| overhead bound | `n / 254 + 1` | `ceil(n / 134) + 1` |
-| round trip | exact | the payload plus **up to six zero bytes** |
+| Module | Contents |
+| --- | --- |
+| `rzcobs_core` | The encoder as a state machine over integers: the three format constants, one byte in and at most two out, the closing header, and the length bound. It holds no buffer and allocates nothing. |
+| `rzcobs` | The same format over buffers: encode and decode a whole payload or write into a cursor the caller owns, the length of a frame's output, the three named refusals, and the search for the next terminator in a stream. |
 
-**Reach for cobs-nv** when the receiver decodes as bytes arrive, when
-the payload has to come back byte-exact, or when the other end is
-already speaking COBS — a UART link, `postcard-rpc`, an existing
-protocol.
+## How to choose an entry point
 
-**Reach for rzcobs-nv** when the sender is a device with an interrupt to
-get out of and the payload is structured binary with zeros in it — a log
-frame, a telemetry record — and when the receiver is a host that has the
-whole frame anyway.  The reverse header is not a curiosity: it means the
-encoder is append-only, so it can write straight into a queue that only
-moves forward, with no reserved byte to come back and patch.  cobs-nv's
-own `encode_into` has a `patch()` that seeks; this one has nothing to
-seek to.
+**`rzcobs.encode` and `rzcobs.decode` take a whole payload.** Each
+allocates its answer at exactly the length it needed.
 
-The two costs are real and are stated rather than buried.  Decoding
-needs the whole frame, so there is no streaming decoder here and there
-will not be one.  And the round trip appends up to six zeros, because
-the last chunk is padded to seven slots and a decoder cannot tell a sent
-zero from a padding one; `defmt` lives with this because its frames are
-self-delimiting a layer up, and a caller who cannot must carry its own
-length.
+**`rzcobs.encode_into` and `rzcobs.decode_into` write into a `Cursor`
+you already own.** Size the destination with `rzcobs.max_encoded_len`
+before encoding, and with `rzcobs.decoded_len` before decoding.
 
-## The layer, and why
+**`rzcobs_core.encoder` is the encoder for firmware.** Feed it one byte
+at a time with `push`, write the bytes each step answers, and call
+`finish` at the end of the message. Nothing is allocated, so this is the
+form for an interrupt handler. See "Running on a microcontroller".
 
-`core`.  Everything here is arithmetic over bytes the caller already
-holds — nothing is read, nothing is written, and the encoder's state is
-a value the caller owns rather than a buffer the package hides.  No
-function declares an effect at all, because a framing has nowhere to put
-one.
+**`rzcobs.frame_end` is what a stream reader needs.** It finds the next
+terminator, and answers nothing when the frame is still arriving.
 
-The package is **two modules on purpose**, and the split is the device
-claim:
+## The rules a user needs
 
-* `rzcobs_core` is the encoder as a `@value` state machine over
-  integers.  It builds for a Cortex-M, and `tests/embedded_probe.nv` is
-  that claim in a form the shard audit either links or does not.
-* `rzcobs` is the same format over `Bytes` and `Cursor`, plus the
-  decoder.  It does **not** build for a device, and it is not supposed
-  to: the embedded runtime defines no `novo_bytes_*` symbol, and one
-  host-only function anywhere in a compilation unit is an undefined
-  symbol at link time whether or not the firmware calls it.  So the
-  probe uses `rzcobs_core` and nothing else, and the audit's module walk
-  leaves `rzcobs` out by following the probe's own `use` lines.
+1. **The round trip is not exact.** A decoded message comes back
+   followed by up to six zero bytes. The last chunk is padded to seven
+   slots, and a decoder cannot tell a padding zero from a sent one.
+   defmt lives with this because its frames carry their own length one
+   layer up. A caller who cannot must carry its own length too.
+2. **A payload whose length is a multiple of seven round-trips
+   exactly.** That is the same rule, from the other side.
+3. **This package writes the terminator; COBS implementations usually do
+   not.** The `0x00` is a header value in this format's own alphabet,
+   and a frame without it cannot be decoded, because the decoder has
+   nowhere to start.
+4. **There is no streaming decoder, and there will not be one.**
+   Decoding runs backwards from the terminator, so the whole frame must
+   be in one place first.
+5. **A frame contains exactly one zero byte, and it is the last one.**
+   A stream therefore splits on the terminator and nowhere else.
+   `rzcobs.frame_end` answers `None` for "read more", which is not a
+   fault.
+6. **Size a destination before writing into it.**
+   `rzcobs.max_encoded_len(n)` is `n + ceil(n / 134) + 1`.
+   `rzcobs.decoded_len(frame)` walks the headers once and answers the
+   output length. A cursor with less room than that is a panic, as an
+   index out of range is: a buffer the caller sized wrong is a mistake
+   in the program.
+7. **Decoding answers a value on a bad frame, never a panic.**
+   `RzcobsZeroInFrame(at)` is a zero byte before the end,
+   `RzcobsTruncated(at)` is a header claiming more literals than
+   precede it, and `RzcobsUnterminated(len)` is a frame that does not
+   end in a zero byte. Each carries an offset into the frame.
+8. **The encoder has no failure mode.** `rzcobs_core.push` and `finish`
+   are total functions answering the new state and the bytes to write.
+   A `@value` struct cannot be a `Result` payload (SPEC section 14.5),
+   and the format gives the encoder nothing to refuse.
+9. **One encoder step writes at most two bytes.** That is a literal, and
+   the header that closed the chunk it filled. The emit buffer is a
+   fixed inline array of two for that reason.
 
-## The load-bearing interface
+## Running on a microcontroller
 
-Two decisions, and the second follows from the first.
+novo-lang lets a package state which of its modules can run on a device
+with no heap allocator, and the compiler checks that claim on every
+build. Here the claim covers `rzcobs_core` and nothing else. It takes
+and answers `Int` and `u8`, and it holds no buffer.
 
-**The header follows its chunk.**  That is the whole of "reverse", and
-it is what makes the encoder a forward-only state machine:
+`tests/embedded_probe.nv` is that claim as a program that either builds
+or does not. It builds today:
 
-```novo
-pub @value
-struct RzEncoder
-    run: Int
-    zeros: Int
-
-pub @value
-struct RzEmit
-    enc: RzEncoder
-    out: [u8; 2]
-    len: Int
-
-pub fn push(e: RzEncoder, b: u8) -> RzEmit
-pub fn finish(e: RzEncoder) -> RzEmit
+```bash
+novo build --target=nrf52-qemu tests/embedded_probe.nv
 ```
 
-One byte in, at most two bytes out — a literal, and the header that
-closes the chunk it filled.  `out` is a fixed two-byte inline array
-rather than a list because a list is a heap allocation and this runs in
-an interrupt; two is the bound, and it is asserted in the test file
-rather than promised in a comment.
+The probe produces a Cortex-M4 executable that reads the three
+constants, runs the length bound, and drives the encoder byte by byte to
+the closing header. It builds and it is not run: every function it calls
+is a `todo()` today.
 
-**The state is a `@value` struct, so it cannot report through a
-`Result`.**  A `@value` struct is unboxed, and SPEC § 14.5 excludes it
-from `Result` payloads, optional payloads and fields of boxed structs.
-An encoder that answered `Result<RzEncoder, _>` would not compile, and
-one that boxed itself would allocate on a device.  What is left — and
-what is published — is a total function returning one unboxed value that
-carries both the new state and the bytes.  The encoder has no failure
-mode, so this costs nothing here; `bbqueue-nv`'s README carries the same
-constraint where it does cost something.
+**A device cannot use the `rzcobs` module.** That module speaks `Bytes`
+and `Cursor`, and the embedded runtime defines neither. One host-only
+function anywhere in a compilation unit is an undefined symbol at link
+time on a device, whether or not the firmware calls it. That is why the
+package is two modules, and the decoder is in the host half: a device
+sending logs never decodes one.
 
-The decoder's counterpart is `decoded_len`, and it is public because the
-format made it necessary:
+## What is not included
 
-```novo
-pub fn decoded_len(wire: Bytes) -> Result<Int, RzcobsError>
+- **A streaming decoder.** See rule 4.
+- **A decoder in the device half.** Decoding needs the whole frame and a
+  buffer to put the output in, which is the host's side of a log link.
+- **The defmt log format itself.** This package is the framing only. The
+  bytes inside a frame are an interned format index and its arguments,
+  and reading those is
+  [deflog-decoder](https://novo-lang.org/packages/deflog-decoder)'s job.
+- **A transport.** Nothing here reads or writes. RTT, a UART and a file
+  are all the caller's.
+- **An exact round trip.** See rule 1.
+
+## Related packages
+
+- [cobs-nv](https://novo-lang.org/packages/cobs-nv) is plain Consistent
+  Overhead Byte Stuffing. Its header precedes the block it covers, it
+  decodes forward as bytes arrive, its round trip is exact, and its
+  overhead is one byte per 254. Reach for it when the receiver decodes a
+  stream as it arrives, when the payload must come back byte-exact, or
+  when the other end already speaks COBS.
+- [frame-nv](https://novo-lang.org/packages/frame-nv) is length-prefixed
+  framing, for a link where the payload need not be scanned at all.
+- [deflog-parser](https://novo-lang.org/packages/deflog-parser) and
+  [deflog-decoder](https://novo-lang.org/packages/deflog-decoder) are the
+  deferred-logging packages that read what arrives inside these frames.
+- [bbqueue-nv](https://novo-lang.org/packages/bbqueue-nv) is the
+  single-producer queue a device writes encoded frames into.
+
+## Tests
+
+```bash
+novo test tests/rzcobs_tests.nv       # 19 tests
 ```
 
-A reverse decoder reads the LAST chunk first, so it cannot place its
-first output byte until it knows where the output ends.  Rather than
-hide a two-pass walk inside `decode_into` and leave a caller sizing a
-buffer to guess, the first pass is a function anyone can call.
+Every vector is the `rzcobs` crate's own, with one difference the test
+file names: that crate's `encode` leaves the terminator to its caller
+and this package writes it, so each expected encoding here carries a
+trailing `00` the crate's does not. The payloads and the header bytes
+are unchanged, which is what wire compatibility means:
+`defmt-print` and `probe-rs run` read what this produces.
 
-## The alphabet, exactly
+The suite asserts the three constants, the length bound of one header
+per 134 bytes, that a run of zeros costs one byte per seven, that a
+short chunk is padded to seven slots, that seven bytes with a zero are a
+bitmap and seven without one open a run, that a full run closes with
+`0xFF` and no trailing zero, that the round trip appends up to six
+zeros, that a payload whose length is a multiple of seven round-trips
+exactly, that the output length is known before the output is, that both
+buffer-writing calls allocate nothing, that each of the three refusals
+names its offset, that a stream splits on the terminator and nowhere
+else, and that the device encoder and the buffer encoder agree byte for
+byte.
 
-Each header byte covers the literal bytes that **precede** it.
+The tests compile today and fail at run, each on the `not implemented`
+panic that is its body. That is the expected state of an interface
+release. They turn green one at a time as bodies land.
 
-| header | meaning | output bytes covered |
-| --- | --- | --- |
-| `0x00` | end of frame | — |
-| `0x01`–`0x7F` | a seven-slot bitmap.  Bit *i*, LSB first: 1 means the *i*th byte was `0x00` and is not on the wire; 0 means take one literal from the stream. | exactly 7 |
-| `0x80`–`0xFE` | `1nnnnnnn`: take *n* + 7 literals, then output one `0x00`. | 8–134 |
-| `0xFF` | take 134 literals, and output **no** trailing zero. | 134 |
+## Implementation status
 
-A bitmap of zero would be the byte `0x00`, which ends the frame — so
-seven non-zero bytes cannot be a bitmap.  They open a run instead, which
-is exactly why the `0x80` family exists.  Follow that one rule and every
-vector in `tests/rzcobs_tests.nv` falls out of it.
-
-## The reference implementation
-
-The `rzcobs` Rust crate (MIT/Apache-2.0), which is `defmt`'s default
-framing, and the format description in the defmt book's encoding
-chapter.  Every vector in `tests/rzcobs_tests.nv` is the crate's own,
-with one difference the test file names: the crate's `encode` answers
-the frame and leaves the terminator to its caller, and this package
-writes the terminator, so each expected encoding here carries a trailing
-`00` the crate's does not.  The payloads and the header bytes are
-unchanged, which is what wire compatibility means — `defmt-print` and
-`probe-rs run` decode what this produces.
-
-## Status
-
-| item | implemented |
+| Item | Implemented |
 | --- | --- |
 | `rzcobs_core.bitmap_span`, `.run_span`, `.terminator` | no |
 | `rzcobs_core.encoder`, `.push`, `.finish` | no |
@@ -195,3 +249,9 @@ unchanged, which is what wire compatibility means — `defmt-print` and
 | `rzcobs.decoded_len`, `.decode_into`, `.decode` | no |
 | `rzcobs.frame_end` | no |
 | `rzcobs.RzcobsError.message` | no |
+
+## Licence
+
+Apache-2.0. See `LICENSE`.
+
+<!-- docs/writing-a-readme.md is the style guide for this page. -->

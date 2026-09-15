@@ -1,6 +1,6 @@
 [package]
 name        = "rzcobs-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "Reverse zero-compressing COBS, the framing defmt sends its logs in: a header follows the bytes it covers, so the encoder never seeks back, and a chunk of seven bytes spends one header on a bitmap so that a payload full of zeros comes out shorter than it went in.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 

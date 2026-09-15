@@ -4,6 +4,10 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## 0.0.2 — 2026-09-15
+
+README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
+
 ## 0.0.1 — 2026-09-10
 
 The **interface**, before anyone implements it.  Every signature, every
