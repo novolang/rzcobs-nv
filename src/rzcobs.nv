@@ -124,7 +124,7 @@ pub fn max_encoded_len(len: Int) -> Int
 //     let n = rzcobs.encode_into(out, payload)
 //     println(bytes.to_hex(bytes.slice(out.finish(), 0, n)))   // 1122334455664000
 // ```
-pub fn encode_into(mut dst: Cursor, src: Bytes) -> Int
+pub fn encode_into(var dst: Cursor, src: Bytes) -> Int
     todo("rzcobs.encode_into")
 
 // Encode `src` into a fresh buffer of exactly the length it needed,
@@ -190,7 +190,7 @@ pub fn decoded_len(wire: Bytes) -> Result<Int, RzcobsError>
 //         Ok(n)  => println(bytes.to_hex(bytes.slice(out.finish(), 0, n)))   // 11223344556600
 //         Err(e) => println(e.message())
 // ```
-pub fn decode_into(mut dst: Cursor, wire: Bytes) -> Result<Int, RzcobsError>
+pub fn decode_into(var dst: Cursor, wire: Bytes) -> Result<Int, RzcobsError>
     todo("rzcobs.decode_into")
 
 // Decode `wire` into a fresh buffer of exactly the length it needed.
