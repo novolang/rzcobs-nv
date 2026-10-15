@@ -9,12 +9,6 @@ in, and the
 This package brings the format to novo-lang: an encoder a device can run
 in an interrupt handler, and a decoder for the host that reads the logs.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared
-with its full signature, but every body is a `todo()` that panics when
-called. The package is published so its design can be reviewed and
-depended on before it is implemented. Version 0.1.0 will be the first
-working release.
-
 ## What the format is
 
 A framing turns a stream of bytes into a sequence of messages. The usual
@@ -85,10 +79,7 @@ fn main() [io]
     println(bytes.to_hex(rzcobs.encode(payload)))
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test past the three constants reaches a
-`not implemented: rzcobs.<fn>` panic. The tests are the specification the
-implementation will have to satisfy.
+Build and test with `novo pkg build` and `novo test`.
 
 ## What the package contains
 
@@ -161,7 +152,7 @@ build. Here the claim covers `rzcobs_core` and nothing else. It takes
 and answers `Int` and `u8`, and it holds no buffer.
 
 `tests/embedded_probe.nv` is that claim as a program that either builds
-or does not. It builds today:
+or does not. It builds:
 
 ```bash
 novo build --target=nrf52-qemu tests/embedded_probe.nv
@@ -169,8 +160,7 @@ novo build --target=nrf52-qemu tests/embedded_probe.nv
 
 The probe produces a Cortex-M4 executable that reads the three
 constants, runs the length bound, and drives the encoder byte by byte to
-the closing header. It builds and it is not run: every function it calls
-is a `todo()` today.
+the closing header.
 
 **A device cannot use the `rzcobs` module.** That module speaks `Bytes`
 and `Cursor`, and the embedded runtime defines neither. One host-only
@@ -212,6 +202,7 @@ sending logs never decodes one.
 
 ```bash
 novo test tests/rzcobs_tests.nv       # 19 tests
+novo test tests/rzcobs_edge_tests.nv  # 5 tests
 ```
 
 Every vector is the `rzcobs` crate's own, with one difference the test
@@ -233,22 +224,9 @@ names its offset, that a stream splits on the terminator and nowhere
 else, and that the device encoder and the buffer encoder agree byte for
 byte.
 
-The tests compile today and fail at run, each on the `not implemented`
-panic that is its body. That is the expected state of an interface
-release. They turn green one at a time as bodies land.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `rzcobs_core.bitmap_span`, `.run_span`, `.terminator` | no |
-| `rzcobs_core.encoder`, `.push`, `.finish` | no |
-| `rzcobs_core.max_encoded_len` | no |
-| `rzcobs.max_encoded_len` | no |
-| `rzcobs.encode_into`, `.encode` | no |
-| `rzcobs.decoded_len`, `.decode_into`, `.decode` | no |
-| `rzcobs.frame_end` | no |
-| `rzcobs.RzcobsError.message` | no |
+The edge suite takes what the crate's vectors do not: frames built from
+`0x80`, `0x81`, `0xFE` and `0xFF` run headers rather than bitmaps, an
+empty frame, and the whole text of each of the three refusals.
 
 ## Licence
 

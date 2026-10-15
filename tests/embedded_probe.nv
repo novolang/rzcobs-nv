@@ -11,13 +11,11 @@
 // writes the log, and a framing that could not compile for a device
 // would have no reason to be reverse.
 //
-// It BUILDS; it does not run.  Every function it calls is a `todo()`
-// today, so a device that executed this would panic on the first line
-// of `main`.  What is being checked is the tier: `--target=nrf52-qemu`
-// stamps `@tier(embedded)` on every function it compiles, so the
-// checker walks the module and refuses a `Str` concatenation, a `Bytes`
-// call or an unbounded `while` wherever the implementation later puts
-// one.
+// It BUILDS; it does not run.  What is being checked is the tier:
+// `--target=nrf52-qemu` stamps `@tier(embedded)` on every function it
+// compiles, so the checker walks the module and refuses a `Str`
+// concatenation, a `Bytes` call or an unbounded `while` wherever one is
+// written.
 //
 // `rzcobs` IS NOT USED HERE, and that is the split rather than a
 // convenience: that module speaks `Bytes` and `Cursor`, the embedded

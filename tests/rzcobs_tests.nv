@@ -1,12 +1,6 @@
 // tests/rzcobs_tests.nv — the API tests, written against the
 // signatures.
 //
-// They COMPILE today and they FAIL at run, with `not implemented:
-// rzcobs.<fn>` from the `todo()` that is each body.  That is the
-// expected state of an interface release: the compiler has checked
-// every signature, every type and every effect row, and nothing else
-// has been checked because there is nothing else yet.
-//
 // EVERY VECTOR BELOW IS THE RUST CRATE'S OWN, with one difference the
 // header of each test names: `rzcobs`'s `encode` answers the frame and
 // leaves the terminator to its caller, and this package writes the

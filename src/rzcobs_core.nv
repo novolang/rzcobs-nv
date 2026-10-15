@@ -1,9 +1,6 @@
 // rzcobs_core — the rzCOBS encoder as a state machine that allocates
 // nothing, holds no buffer, and builds for a microcontroller.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
-//
 // WHY THERE IS A SECOND MODULE.  `rzcobs` speaks `Bytes` and `Cursor`,
 // and neither links at `@tier(embedded)`: the embedded runtime defines
 // no `novo_bytes_*` symbol, so a device that called one would fail at
@@ -31,7 +28,7 @@
 // header.  It is the reason a decoded message can come back with up to
 // six zero bytes appended: the last chunk is padded to seven.
 pub fn bitmap_span() -> Int
-    todo("rzcobs_core.bitmap_span")
+    7
 
 // The most literal bytes one run header can cover.
 //
@@ -39,7 +36,7 @@ pub fn bitmap_span() -> Int
 // and `n` is seven bits, so 127 + 7.  It is also the format's overhead
 // bound: a message of non-zero bytes costs one header per 134 of them.
 pub fn run_span() -> Int
-    todo("rzcobs_core.run_span")
+    134
 
 // The byte that ends a frame.
 //
@@ -47,7 +44,7 @@ pub fn run_span() -> Int
 // which is what lets a receiver split a stream into frames by looking
 // for it and nothing else.
 pub fn terminator() -> Int
-    todo("rzcobs_core.terminator")
+    0
 
 // The encoder between two bytes: the chunk it has open, and nothing
 // else.
@@ -96,7 +93,53 @@ struct RzEmit
 //     println("${e.run} ${e.zeros}")   // 0 0
 // ```
 pub fn encoder() -> RzEncoder
-    todo("rzcobs_core.encoder")
+    RzEncoder { run: 0, zeros: 0 }
+
+// The header that closes a run of `run` non-zero bytes.  The low
+// seven bits are the count above seven, which is what `1nnnnnnn`
+// carries; the header covers no trailing zero when it is all ones.
+fn run_header(run: Int) -> Int
+    (run - bitmap_span()) | 0x80
+
+// One byte into the chunk being built.  A zero is a bit of the bitmap
+// and never a byte on the wire, a non-zero is a literal, and the
+// seventh byte closes the chunk unless the bitmap came out empty.
+fn chunk_step(e: RzEncoder, b: u8) -> RzEmit
+    var zeros = e.zeros
+    if b == 0
+        zeros = zeros | (1 << e.run)
+    let run = e.run + 1
+    if run < bitmap_span()
+        if b == 0
+            // The chunk is not full, so there is nothing to write yet.
+            RzEmit { enc: RzEncoder { run: run, zeros: zeros }, out: [0 as u8, 0 as u8], len: 0 }
+        else
+            RzEmit { enc: RzEncoder { run: run, zeros: zeros }, out: [b, 0 as u8], len: 1 }
+    elif zeros == 0
+        // A bitmap of zero would be the terminator, so seven non-zero
+        // bytes cannot be one: they open a run instead, and the run
+        // header carries the zero byte that follows them.
+        RzEmit { enc: RzEncoder { run: run, zeros: 0 }, out: [b, 0 as u8], len: 1 }
+    elif b == 0
+        RzEmit { enc: RzEncoder { run: 0, zeros: 0 }, out: [zeros as u8, 0 as u8], len: 1 }
+    else
+        RzEmit { enc: RzEncoder { run: 0, zeros: 0 }, out: [b, zeros as u8], len: 2 }
+
+// One byte into the run of non-zero bytes that is open.  A zero closes
+// the run with its own length as the header, and the zero byte that
+// header stands for is not written either; 0xFF closes it at 134
+// literals with no zero of its own.
+fn run_step(e: RzEncoder, b: u8) -> RzEmit
+    if b == 0
+        RzEmit { enc: RzEncoder { run: 0, zeros: 0 },
+            out: [run_header(e.run) as u8, 0 as u8],
+            len: 1 }
+    else
+        let run = e.run + 1
+        if run < run_span()
+            RzEmit { enc: RzEncoder { run: run, zeros: 0 }, out: [b, 0 as u8], len: 1 }
+        else
+            RzEmit { enc: RzEncoder { run: 0, zeros: 0 }, out: [b, 0xFF as u8], len: 2 }
 
 // Feed one byte, and answer the encoder after it with the bytes to
 // write.
@@ -132,7 +175,17 @@ pub fn encoder() -> RzEncoder
 //     println("${step.len}")   // 1
 // ```
 pub fn push(e: RzEncoder, b: u8) -> RzEmit
-    todo("rzcobs_core.push")
+    if e.run >= bitmap_span()
+        run_step(e, b)
+    else
+        chunk_step(e, b)
+
+// The bitmap bits of the slots a chunk shorter than seven never
+// filled.  The padding is indistinguishable from sent zeros once it is
+// decoded, which is why a round trip can answer more bytes than it was
+// given.
+fn padding_bits(run: Int) -> Int
+    ((1 << (bitmap_span() - run)) - 1) << run
 
 // Close the message and answer the last header and the terminator.
 //
@@ -156,7 +209,17 @@ pub fn push(e: RzEncoder, b: u8) -> RzEmit
 //     println("${step.len}")   // 1
 // ```
 pub fn finish(e: RzEncoder) -> RzEmit
-    todo("rzcobs_core.finish")
+    if e.run == 0
+        // The chunk consumed nothing, so there is none to close.
+        RzEmit { enc: RzEncoder { run: 0, zeros: 0 }, out: [0 as u8, 0 as u8], len: 1 }
+    elif e.run >= bitmap_span()
+        RzEmit { enc: RzEncoder { run: 0, zeros: 0 },
+            out: [run_header(e.run) as u8, 0 as u8],
+            len: 2 }
+    else
+        RzEmit { enc: RzEncoder { run: 0, zeros: 0 },
+            out: [(e.zeros | padding_bits(e.run)) as u8, 0 as u8],
+            len: 2 }
 
 // The most bytes `push` and `finish` can produce for a message of
 // `len` bytes, terminator included.
@@ -174,4 +237,4 @@ pub fn finish(e: RzEncoder) -> RzEmit
 //     println("${rzcobs_core.max_encoded_len(134)}")   // 136
 // ```
 pub fn max_encoded_len(len: Int) -> Int
-    todo("rzcobs_core.max_encoded_len")
+    len + (len + run_span() - 1) / run_span() + 1

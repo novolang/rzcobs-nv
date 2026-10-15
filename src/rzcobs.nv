@@ -1,9 +1,6 @@
 // rzcobs — reverse zero-compressing COBS, the framing `defmt` sends its
 // logs in, over buffers the caller owns.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
-//
 // WHAT IT IS.  A framing that removes every zero byte from a payload so
 // that a zero can end a frame, exactly as COBS does — and then spends
 // the header byte it needed anyway on a bitmap, so that a payload full
@@ -43,6 +40,7 @@
 // caller who needs the exact length carries it above this layer.
 
 use std.bytes
+use rzcobs_core
 
 // What went wrong while decoding, and where.
 //
@@ -75,8 +73,12 @@ impl Error for RzcobsError
     // which offset in it.  The offset is in the text rather than left
     // for the caller to add, because a receiver logging one frame in a
     // thousand is the caller least likely to still have the frame.
+    @tier(app)
     fn message(self) -> Str
-        todo("rzcobs.RzcobsError.message")
+        match self
+            RzcobsZeroInFrame(at)   => "rzcobs: a zero byte at offset ${at}, which a frame contains only as its terminator"
+            RzcobsTruncated(at)     => "rzcobs: the header at offset ${at} covers more literals than the frame has before it"
+            RzcobsUnterminated(len) => "rzcobs: a frame of ${len} bytes with no zero byte at its end"
 
 // The most bytes `encode` can produce from `len` bytes of payload,
 // terminator included.
@@ -96,7 +98,14 @@ impl Error for RzcobsError
 //     println("${rzcobs.max_encoded_len(134)}")   // 136
 // ```
 pub fn max_encoded_len(len: Int) -> Int
-    todo("rzcobs.max_encoded_len")
+    rzcobs_core.max_encoded_len(len)
+
+// Put the bytes one encoder step produced on the cursor, and nothing
+// when it produced none.  Two bytes is the most a step carries, and
+// `len` says how many of them are real.
+fn write_step(var dst: Cursor, step: RzEmit)
+    for k in 0..step.len
+        dst.put_u8(step.out[k] as Int)
 
 // Encode `src` at the cursor and answer the byte count written,
 // terminator included.  Writes into the caller's buffer and allocates
@@ -124,8 +133,16 @@ pub fn max_encoded_len(len: Int) -> Int
 //     let n = rzcobs.encode_into(out, payload)
 //     println(bytes.to_hex(bytes.slice(out.finish(), 0, n)))   // 1122334455664000
 // ```
-pub fn encode_into(var dst: Cursor, src: Bytes) -> Int
-    todo("rzcobs.encode_into")
+pub @tier(app)
+fn encode_into(var dst: Cursor, src: Bytes) -> Int
+    let start = dst.pos()
+    var e = rzcobs_core.encoder()
+    for i in 0..bytes.len(src)
+        let step = rzcobs_core.push(e, (bytes.byte_at(src, i) ?? 0) as u8)
+        e = step.enc
+        write_step(dst, step)
+    write_step(dst, rzcobs_core.finish(e))
+    dst.pos() - start
 
 // Encode `src` into a fresh buffer of exactly the length it needed,
 // terminator included.
@@ -143,8 +160,78 @@ pub fn encode_into(var dst: Cursor, src: Bytes) -> Int
 //     let payload = bytes.from_hex("00000000000000000000000000ff") ?? bytes.zeros(0)
 //     println(bytes.to_hex(rzcobs.encode(payload)))   // 7fff3f00
 // ```
-pub fn encode(src: Bytes) -> Bytes
-    todo("rzcobs.encode")
+pub @tier(app)
+fn encode(src: Bytes) -> Bytes
+    var out = bytes.cursor_le(bytes.zeros(max_encoded_len(bytes.len(src))))
+    let n = encode_into(out, src)
+    bytes.slice(out.finish(), 0, n)
+
+// Whether slot `k` of a bitmap header, counting from the least
+// significant bit, is one the encoder marked as zero.
+fn bit_is_set(bitmap: Int, k: Int) -> Bool
+    ((bitmap >> k) & 1) == 1
+
+// How many of a bitmap header's seven slots hold a zero.  A bitmap
+// covers its slots whatever they held, so this is the count of bytes
+// the encoder left off the wire.
+fn zeros_in_bitmap(bitmap: Int) -> Int
+    var count = 0
+    for k in 0..rzcobs_core.bitmap_span()
+        if bit_is_set(bitmap, k)
+            count = count + 1
+    count
+
+// How many bytes before a header it takes as literals.  A bitmap names
+// its seven slots and every slot it did not mark as zero is one
+// literal; a run header names its literal count outright.
+fn literal_count(header: Int) -> Int
+    if header <= 0x7F
+        rzcobs_core.bitmap_span() - zeros_in_bitmap(header)
+    elif header == 0xFF
+        rzcobs_core.run_span()
+    else
+        header - 0x80 + 7
+
+// How many bytes of output the chunk a header closes covers.  A bitmap
+// covers its seven slots; a run covers its literals and, below 0xFF,
+// the one zero byte the header itself stands for.
+fn output_span(header: Int) -> Int
+    if header <= 0x7F
+        rzcobs_core.bitmap_span()
+    elif header == 0xFF
+        rzcobs_core.run_span()
+    else
+        header - 0x80 + 8
+
+// The offset of the first zero byte at or before `last`, or `None`
+// when the frame holds none.  The terminator is the only zero an
+// encoding produces, so any other one is the frame being wrong rather
+// than a header to read.
+@tier(app)
+fn first_zero(wire: Bytes, last: Int) -> ?Int
+    var at = 0
+    while at <= last
+        if (bytes.byte_at(wire, at) ?? 1) == rzcobs_core.terminator()
+            return Some(at)
+        at = at + 1
+    None
+
+// How many bytes a frame's headers decode to.  A header follows the
+// bytes it covers, so this walks from the terminator back to the start
+// and adds each chunk's count as it is reached, which is the one walk
+// that answers the length without placing a byte.
+@tier(app)
+fn header_walk(wire: Bytes, last: Int) -> Result<Int, RzcobsError>
+    var at = last
+    var total = 0
+    while at >= 0
+        let header = bytes.byte_at(wire, at) ?? 0
+        let literals = literal_count(header)
+        if literals > at
+            return Err(RzcobsTruncated(at: at))
+        total = total + output_span(header)
+        at = at - 1 - literals
+    Ok(total)
 
 // How many bytes `wire` decodes to, without decoding it.
 //
@@ -168,8 +255,55 @@ pub fn encode(src: Bytes) -> Bytes
 //         Ok(n)  => println("${n}")   // 7
 //         Err(e) => println(e.message())
 // ```
-pub fn decoded_len(wire: Bytes) -> Result<Int, RzcobsError>
-    todo("rzcobs.decoded_len")
+pub @tier(app)
+fn decoded_len(wire: Bytes) -> Result<Int, RzcobsError>
+    let len = bytes.len(wire)
+    if len == 0
+        Err(RzcobsUnterminated(len: len))
+    elif (bytes.byte_at(wire, len - 1) ?? -1) != rzcobs_core.terminator()
+        Err(RzcobsUnterminated(len: len))
+    else
+        match first_zero(wire, len - 2)
+            Some(at) => Err(RzcobsZeroInFrame(at: at))
+            None     => header_walk(wire, len - 2)
+
+// Write the output bytes of one chunk at the cursor, which the caller
+// has already put at the start of the region they occupy.  A bitmap
+// writes a zero for each slot it marked and takes a literal for each
+// slot it did not; a run header takes its literals and then writes
+// the zero byte it stands for, unless it is 0xFF and stands for none.
+@tier(app)
+fn place_chunk(var dst: Cursor, wire: Bytes, from: Int, header: Int)
+    if header <= 0x7F
+        var src = from
+        for k in 0..rzcobs_core.bitmap_span()
+            if bit_is_set(header, k)
+                dst.put_u8(0)
+            else
+                dst.put_u8(bytes.byte_at(wire, src) ?? 0)
+                src = src + 1
+    else
+        for k in 0..literal_count(header)
+            dst.put_u8(bytes.byte_at(wire, from + k) ?? 0)
+        if header != 0xFF
+            dst.put_u8(0)
+
+// Place every chunk of a frame at the offset it decodes to.  The walk
+// runs from the terminator back, because the last chunk is the one
+// nearest the end of the output and a chunk's start is only known once
+// the chunk after it has been placed.
+@tier(app)
+fn place_chunks(var dst: Cursor, wire: Bytes, total: Int)
+    var at = bytes.len(wire) - 2
+    var end = total
+    while at >= 0
+        let header = bytes.byte_at(wire, at) ?? 0
+        let literals = literal_count(header)
+        let start = end - output_span(header)
+        dst.seek(start)
+        place_chunk(dst, wire, at - literals, header)
+        at = at - 1 - literals
+        end = start
 
 // Decode `wire` at the cursor and answer the byte count written.
 // Writes into the caller's buffer and allocates nothing.
@@ -190,8 +324,12 @@ pub fn decoded_len(wire: Bytes) -> Result<Int, RzcobsError>
 //         Ok(n)  => println(bytes.to_hex(bytes.slice(out.finish(), 0, n)))   // 11223344556600
 //         Err(e) => println(e.message())
 // ```
-pub fn decode_into(var dst: Cursor, wire: Bytes) -> Result<Int, RzcobsError>
-    todo("rzcobs.decode_into")
+pub @tier(app)
+fn decode_into(var dst: Cursor, wire: Bytes) -> Result<Int, RzcobsError>
+    let total = decoded_len(wire)!
+    place_chunks(dst, wire, total)
+    dst.seek(total)
+    Ok(total)
 
 // Decode `wire` into a fresh buffer of exactly the length it needed.
 //
@@ -210,8 +348,14 @@ pub fn decode_into(var dst: Cursor, wire: Bytes) -> Result<Int, RzcobsError>
 //         Ok(p)  => println(bytes.to_hex(p))   // 00000000000000000000000000ff
 //         Err(e) => println(e.message())
 // ```
-pub fn decode(wire: Bytes) -> Result<Bytes, RzcobsError>
-    todo("rzcobs.decode")
+pub @tier(app)
+fn decode(wire: Bytes) -> Result<Bytes, RzcobsError>
+    // The walk sizes the buffer at exactly the length the frame decodes
+    // to, so the whole of it is the answer and the count `decode_into`
+    // answers is not needed to trim it.
+    var out = bytes.cursor_le(bytes.zeros(decoded_len(wire)!))
+    let _ = decode_into(out, wire)!
+    Ok(out.finish())
 
 // Where the frame that starts at `from` ends, as the offset of its 0x00
 // terminator — or `None` when `buf` holds no terminator at or after
@@ -232,5 +376,6 @@ pub fn decode(wire: Bytes) -> Result<Bytes, RzcobsError>
 //         None    => println("partial")
 //         Some(i) => println("${i}")   // 2
 // ```
-pub fn frame_end(buf: Bytes, from: Int) -> ?Int
-    todo("rzcobs.frame_end")
+pub @tier(app)
+fn frame_end(buf: Bytes, from: Int) -> ?Int
+    bytes.find_byte(buf, rzcobs_core.terminator(), from)

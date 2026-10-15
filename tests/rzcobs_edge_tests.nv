@@ -1,0 +1,84 @@
+// tests/rzcobs_edge_tests.nv — the parts of the decoder the API suite
+// does not reach: frames built from run headers rather than bitmaps, an
+// empty frame, and the text each fault reports.
+//
+// A run header is the half of the alphabet the crate's vectors never
+// decode.  `0x80..=0xFF` carries a payload of non-zero bytes, which is
+// what a device sends when nothing in a log line is zero, and a decoder
+// that only ever walked bitmaps would answer the wrong length and place
+// the wrong bytes without failing.
+
+use std.test
+use std.bytes
+use rzcobs
+
+// A payload written the way a reader can check it against the crate.
+fn hex(s: Str) -> Bytes
+    bytes.from_hex(s) ?? bytes.zeros(0)
+
+@test
+fn test_a_run_header_decodes_to_its_literals_and_its_zero()
+    // Seven literals and the 0x80 header standing for the zero that
+    // closed the run: the family in its shortest form.
+    match rzcobs.decode(hex("112233445566778000"))
+        Err(e) => test.fail(e.message())
+        Ok(p)  => test.assert_eq(bytes.to_hex(p), "1122334455667700")
+    // One more literal, and the header counts it: 0x81 covers eight.
+    match rzcobs.decode(hex("11223344556677888100"))
+        Err(e) => test.fail(e.message())
+        Ok(p)  => test.assert_eq(bytes.to_hex(p), "112233445566778800")
+
+@test
+fn test_a_run_one_byte_short_of_a_full_one_closes_with_fe()
+    // 133 literals and the zero that ended the run: the header is 0xFE,
+    // the top of the `1nnnnnnn` family, and the zero it stands for is
+    // the run's last output byte.
+    var payload = bytes.zeros(0)
+    for i in 0..133
+        payload = bytes.concat([payload, bytes.u8(i % 255 + 1)])
+    payload = bytes.concat([payload, bytes.u8(0)])
+    let wire = rzcobs.encode(payload)
+    test.assert_eq(bytes.len(wire), 135)
+    test.assert_eq(bytes.byte_at(wire, 133) ?? 0, 0xFE)
+    match rzcobs.decode(wire)
+        Err(e) => test.fail(e.message())
+        Ok(p)  => test.assert_eq(bytes.to_hex(p), bytes.to_hex(payload))
+
+@test
+fn test_a_full_run_decodes_without_a_trailing_zero()
+    // 134 non-zero bytes is all one 0xFF header covers, and that header
+    // stands for no zero, so the payload comes back with nothing added.
+    var payload = bytes.zeros(0)
+    for i in 0..134
+        payload = bytes.concat([payload, bytes.u8(i % 255 + 1)])
+    match rzcobs.decode(rzcobs.encode(payload))
+        Err(e) => test.fail(e.message())
+        Ok(p)  => test.assert_eq(bytes.to_hex(p), bytes.to_hex(payload))
+
+@test
+fn test_an_empty_frame_is_unterminated_at_no_offset()
+    // A wire with no bytes has no terminator to end it, and the fault
+    // carries the length rather than an offset into nothing.
+    match rzcobs.decoded_len(bytes.zeros(0))
+        Err(e) =>
+            match e
+                RzcobsUnterminated(n) => test.assert_eq(n, 0)
+                RzcobsZeroInFrame(at) => test.fail("expected unterminated, got a zero at ${at}")
+                RzcobsTruncated(at)   => test.fail("expected unterminated, got truncated at ${at}")
+        Ok(n)  => test.fail("an empty frame has no decoded length, got ${n}")
+
+@test
+fn test_each_fault_reports_its_variant_and_its_offset()
+    // The text a receiver logs is part of the interface, so it is
+    // pinned whole rather than searched for a substring.
+    match rzcobs.decode(hex("01000000"))
+        Ok(p)  => test.fail("a zero at offset 1 is not decodable: ${bytes.to_hex(p)}")
+        Err(e) => test.assert_eq(e.message(),
+            "rzcobs: a zero byte at offset 1, which a frame contains only as its terminator")
+    match rzcobs.decode(hex("118100"))
+        Ok(p)  => test.fail("a header over the frame's start is not decodable: ${bytes.to_hex(p)}")
+        Err(e) => test.assert_eq(e.message(),
+            "rzcobs: the header at offset 1 covers more literals than the frame has before it")
+    match rzcobs.decode(hex("017e"))
+        Ok(p)  => test.fail("an unterminated frame is not decodable: ${bytes.to_hex(p)}")
+        Err(e) => test.assert_eq(e.message(), "rzcobs: a frame of 2 bytes with no zero byte at its end")

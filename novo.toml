@@ -1,15 +1,10 @@
 [package]
 name        = "rzcobs-nv"
-version     = "0.0.2"
-description = "Reverse zero-compressing COBS, the framing defmt sends its logs in: a header follows the bytes it covers, so the encoder never seeks back, and a chunk of seven bytes spends one header on a bitmap so that a payload full of zeros comes out shorter than it went in.  Interface only — every body is a todo()."
+version     = "0.1.0"
+description = "Reverse zero-compressing COBS, the framing defmt sends its logs in: a header follows the bytes it covers, so the encoder never seeks back, and a chunk of seven bytes spends one header on a bitmap so that a payload full of zeros comes out shorter than it went in."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+stability   = "experimental"
 
 # `core`: arithmetic over bytes the caller already holds, and no
 # transport.  Nothing here declares an effect at all — a framing has
@@ -21,7 +16,7 @@ category    = "encoding"
 tags        = ["rzcobs", "cobs", "framing", "defmt", "deferred-logging", "serial", "embedded", "sans-io"]
 repository  = "https://github.com/novolang/rzcobs-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.8.9"
+novo        = ">= 0.20.2"
 
 [docs.pages]
 "README.md" = "Framing a log stream the way defmt frames one"
