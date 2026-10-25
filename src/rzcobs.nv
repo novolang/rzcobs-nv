@@ -140,8 +140,8 @@ fn encode_into(var dst: Cursor, src: Bytes) -> Int
     for i in 0..bytes.len(src)
         let step = rzcobs_core.push(e, (bytes.byte_at(src, i) ?? 0) as u8)
         e = step.enc
-        write_step(dst, step)
-    write_step(dst, rzcobs_core.finish(e))
+        write_step(var dst, step)
+    write_step(var dst, rzcobs_core.finish(e))
     dst.pos() - start
 
 // Encode `src` into a fresh buffer of exactly the length it needed,
@@ -163,7 +163,7 @@ fn encode_into(var dst: Cursor, src: Bytes) -> Int
 pub @tier(app)
 fn encode(src: Bytes) -> Bytes
     var out = bytes.cursor_le(bytes.zeros(max_encoded_len(bytes.len(src))))
-    let n = encode_into(out, src)
+    let n = encode_into(var out, src)
     bytes.slice(out.finish(), 0, n)
 
 // Whether slot `k` of a bitmap header, counting from the least
@@ -301,7 +301,7 @@ fn place_chunks(var dst: Cursor, wire: Bytes, total: Int)
         let literals = literal_count(header)
         let start = end - output_span(header)
         dst.seek(start)
-        place_chunk(dst, wire, at - literals, header)
+        place_chunk(var dst, wire, at - literals, header)
         at = at - 1 - literals
         end = start
 
@@ -327,7 +327,7 @@ fn place_chunks(var dst: Cursor, wire: Bytes, total: Int)
 pub @tier(app)
 fn decode_into(var dst: Cursor, wire: Bytes) -> Result<Int, RzcobsError>
     let total = decoded_len(wire)!
-    place_chunks(dst, wire, total)
+    place_chunks(var dst, wire, total)
     dst.seek(total)
     Ok(total)
 
@@ -354,7 +354,7 @@ fn decode(wire: Bytes) -> Result<Bytes, RzcobsError>
     // to, so the whole of it is the answer and the count `decode_into`
     // answers is not needed to trim it.
     var out = bytes.cursor_le(bytes.zeros(decoded_len(wire)!))
-    let _ = decode_into(out, wire)!
+    let _ = decode_into(var out, wire)!
     Ok(out.finish())
 
 // Where the frame that starts at `from` ends, as the offset of its 0x00
